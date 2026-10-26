@@ -1,163 +1,221 @@
-import io
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""logqhint tests — aligned with the module's real API (RULES / scan_file /
+read_lines / iter_log_files / main). Rewritten 2026-10-26: the previous
+cloud-generated tests invented APIs (parse_rules/match_line) that never
+existed, so all 14 tests failed with AttributeError."""
+import json
 import os
+import subprocess
 import sys
 import tempfile
-import textwrap
 import unittest
-from contextlib import redirect_stdout, redirect_stderr
-from pathlib import Path
+from io import StringIO
+from unittest import mock
 
 import logqhint
 
-
-def write_temp(text):
-    f = tempfile.NamedTemporaryFile("w", suffix=".log", delete=False, encoding="utf-8")
-    f.write(textwrap.dedent(text))
-    f.close()
-    self_add_cleanup = f.name
-    return self_add_cleanup
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 
-class RuleMatchingTest(unittest.TestCase):
+def _write(tmp, name, text):
+    p = os.path.join(tmp, name)
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(text)
+    return p
+
+
+class RulesTest(unittest.TestCase):
+    def test_rules_shape(self):
+        self.assertGreaterEqual(len(logqhint.RULES), 10)
+        ids = [r[0] for r in logqhint.RULES]
+        self.assertEqual(len(ids), len(set(ids)), "rule ids must be unique")
+        for rid, sev, cat, rx, desc in logqhint.RULES:
+            self.assertIn(sev, logqhint.SEV_ORDER)
+            self.assertTrue(hasattr(rx, "search"), f"{rid} regex must be compiled")
+            self.assertTrue(desc)
+
+    def test_sev_order(self):
+        self.assertLess(logqhint.SEV_ORDER["low"], logqhint.SEV_ORDER["mid"])
+        self.assertLess(logqhint.SEV_ORDER["mid"], logqhint.SEV_ORDER["high"])
+
+    def test_sqli_rule_matches_payload(self):
+        sqli = next(r for r in logqhint.RULES if r[0] == "SQLI")
+        self.assertIsNotNone(
+            sqli[3].search("GET /a.php?id=1 UNION SELECT password FROM users--"))
+
+    def test_scanner_rule_matches_tool_ua(self):
+        scan = next(r for r in logqhint.RULES if r[0] == "WEB-SCAN")
+        self.assertIsNotNone(scan[3].search("Mozilla/5.0 (compatible; sqlmap/1.7)"))
+
+
+class ScanFileTest(unittest.TestCase):
     def setUp(self):
-        self.rules_text = textwrap.dedent("""\
-            # 注释行应被忽略
-            [CRIT] Failed password
-            [WARN] disk
-            """)
-        self.rules = logqhint.parse_rules(self.rules_text)
+        self.tmp = tempfile.mkdtemp(prefix="lqh_")
 
-    def test_parse_rules_count_and_fields(self):
-        self.assertEqual(len(self.rules), 2)
-        crit = self.rules[0]
-        self.assertEqual(crit["level"], "CRIT")
-        self.assertIn("Failed password", crit["pattern"])
+    def test_auth_fail_findings(self):
+        p = _write(self.tmp, "auth.log",
+                   "Jan 5 10:00:01 host sshd[9]: Failed password for root from 203.0.113.9 port 22\n"
+                   "Jan 5 10:00:02 host sshd[9]: Failed password for root from 203.0.113.9 port 22\n")
+        findings, brute = logqhint.scan_file(p, logqhint.SEV_ORDER["low"], None)
+        by_rule = {f["rule"]: f for f in findings}
+        self.assertIn("AUTH-FAIL", by_rule)
+        self.assertEqual(by_rule["AUTH-FAIL"]["count"], 2)
+        self.assertLessEqual(len(by_rule["AUTH-FAIL"]["samples"]), 2)
+        self.assertEqual(by_rule["AUTH-FAIL"]["severity"], "mid")
+        self.assertIn("203.0.113.9", brute)
 
-    def test_comment_and_blank_lines_skipped(self):
-        lines = [ln for ln in self.rules_text.splitlines()]
-        self.assertEqual(len(logqhint.parse_rules("\n\n".join(lines))), 2)
+    def test_severity_filter_excludes_low(self):
+        p = _write(self.tmp, "app.log", "2026-01-05 ERROR disk full\n")
+        findings, _ = logqhint.scan_file(p, logqhint.SEV_ORDER["mid"], None)
+        self.assertNotIn("LOG-ERROR", {f["rule"] for f in findings})
 
-    def test_match_by_substring(self):
-        hits = logqhint.match_line("Oct 23 10:00:01 host sshd: Failed password for root", self.rules)
-        self.assertEqual(len(hits), 1)
-        self.assertEqual(hits[0]["level"], "CRIT")
+    def test_empty_and_bad_lines_tolerated(self):
+        p = _write(self.tmp, "weird.log", "\n\n\x00\xff\xfe binary junk \x00\n\n")
+        findings, _ = logqhint.scan_file(p, logqhint.SEV_ORDER["low"], None)
+        self.assertEqual(findings, [])
 
-    def test_no_match_returns_empty(self):
-        self.assertEqual(logqhint.match_line("normal systemd start", self.rules), [])
+    def test_brute_aggregation_counts_by_source(self):
+        lines = "".join(
+            f"Jan 5 10:00:{i:02d} host sshd[9]: Failed password for invalid user admin from 198.51.100.7 port 22\n"
+            for i in range(6))
+        p = _write(self.tmp, "brute.log", lines)
+        _, brute = logqhint.scan_file(p, logqhint.SEV_ORDER["low"], None)
+        self.assertEqual(brute.get("198.51.100.7"), 6)
 
-    def test_match_is_case_sensitive_by_default(self):
-        self.assertEqual(logqhint.match_line("failed password for root", self.rules), [])
+
+class ExtractSourceTest(unittest.TestCase):
+    def test_ip_wins(self):
+        self.assertEqual(logqhint._extract_source("from 1.2.3.4 port 22"), "1.2.3.4")
+
+    def test_user_fallback(self):
+        # "for <name>" 提取；"for user bob" 会先匹配到 "for"→"user"（实现的真实启发式）
+        self.assertEqual(logqhint._extract_source("Failed password for bob"), "user:bob")
+        self.assertEqual(
+            logqhint._extract_source("Failed password for invalid user carl"), "user:carl")
+
+    def test_unknown(self):
+        self.assertEqual(logqhint._extract_source("nothing here"), "(unknown)")
 
 
-class AggregationTest(unittest.TestCase):
+class ReadLinesTest(unittest.TestCase):
     def setUp(self):
-        self.rules = logqhint.parse_rules("[CRIT] Failed password\n[WARN] disk")
+        self.tmp = tempfile.mkdtemp(prefix="lqh_")
 
-    def _scan(self, lines):
-        return logqhint.scan_lines(iter(lines), self.rules)
+    def test_tail_keeps_last_n(self):
+        p = _write(self.tmp, "t.log", "".join(f"line{i}\n" for i in range(10)))
+        self.assertEqual([l.strip() for l in logqhint.read_lines(p, tail=3)],
+                         ["line7", "line8", "line9"])
 
-    def test_multi_event_grouped_by_rule(self):
-        lines = [
-            "sshd: Failed password for root from 1.2.3.4",
-            "sshd: Failed password for admin from 5.6.7.8",
-            "sshd: Failed password for root from 9.9.9.9",
-            "kernel: disk I/O error on sda",
-        ]
-        events = self._scan(lines)
-        self.assertEqual(len(events), 4)
-        summary = logqhint.summarize(events)
-        # CRIT 组应聚合到 3 次
-        self.assertIn("3", summary)
-        self.assertIn("CRIT", summary)
-        # WARN 组 1 次
-        self.assertIn("WARN", summary)
+    def test_missing_file_returns_empty(self):
+        p = os.path.join(self.tmp, "nope.log")
+        self.assertEqual(logqhint.read_lines(p), [])
 
-    def test_counts_match_events(self):
-        lines = ["disk full"] * 5
-        events = self._scan(lines)
-        self.assertEqual(len(events), 5)
-        summary = logqhint.summarize(events)
-        self.assertIn("5", summary)
-
-    def test_no_events_summary_is_clean(self):
-        summary = logqhint.summarize(self._scan(["all good", "nothing here"]))
-        self.assertEqual(summary.strip(), "")
-        self.assertEqual(logqhint.summarize(self._scan([])).strip(), "")
+    def test_bad_bytes_replaced(self):
+        p = _write(self.tmp, "b.log", "ÿþ ok\n")
+        self.assertEqual(len(logqhint.read_lines(p)), 1)
 
 
-class FaultToleranceTest(unittest.TestCase):
+class IterLogFilesTest(unittest.TestCase):
     def setUp(self):
-        self.rules = logqhint.parse_rules("[CRIT] Failed password")
+        self.tmp = tempfile.mkdtemp(prefix="lqh_")
 
-    def _scan_file(self, path):
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            return logqhint.scan_lines(fh, self.rules)
+    def test_file_passthrough(self):
+        p = _write(self.tmp, "a.log", "x\n")
+        self.assertEqual(list(logqhint.iter_log_files(p)), [p])
 
-    def test_empty_file_yields_no_events(self):
-        path = write_temp("")
-        try:
-            self.assertEqual(self._scan_file(path), [])
-        finally:
-            os.unlink(path)
+    def test_dir_skips_archives_and_empty(self):
+        _write(self.tmp, "real.log", "content\n")
+        _write(self.tmp, "old.gz", "junk")
+        _write(self.tmp, "empty.log", "")
+        got = {os.path.basename(p) for p in logqhint.iter_log_files(self.tmp)}
+        self.assertEqual(got, {"real.log"})
 
-    def test_bad_lines_are_skipped_not_fatal(self):
-        path = write_temp("""\
-            \x00\xff\xfe binary junk
-            Failed password for root
-            \x00\x01more junk
-            """)
-        try:
-            events = self._scan_file(path)
-            # 坏行不应崩溃，好行仍被命中
-            self.assertEqual(len(events), 1)
-            self.assertIn("Failed password", events[0]["line"])
-        finally:
-            os.unlink(path)
-
-    def test_missing_file_raises_clean_error(self):
-        with self.assertRaises(FileNotFoundError):
-            self._scan_file("/nonexistent/path/x.log")
+    def test_missing_path_raises_sysexit(self):
+        with self.assertRaises(SystemExit):
+            list(logqhint.iter_log_files(os.path.join(self.tmp, "ghost")))
 
 
-class CliTest(unittest.TestCase):
+class MainTest(unittest.TestCase):
     def setUp(self):
-        self.rules_path = write_temp("[CRIT] Failed password\n[WARN] disk")
-        self.log_path = write_temp("""\
-            sshd: Failed password for root from 1.2.3.4
-            sshd: Failed password for admin from 5.6.7.8
-            kernel: disk error
-            """)
-        self.argv_backup = sys.argv
+        self.tmp = tempfile.mkdtemp(prefix="lqh_")
+        self.log = _write(self.tmp, "attack.log",
+                          "Jan 5 10:00:01 h sshd[1]: Failed password for root from 9.9.9.9 port 22\n"
+                          "Jan 5 10:00:02 h httpd: 1 UNION SELECT password FROM users--\n")
 
-    def tearDown(self):
-        sys.argv = self.argv_backup
-        os.unlink(self.rules_path)
-        os.unlink(self.log_path)
+    def run_main(self, argv):
+        buf = StringIO()
+        with mock.patch.object(sys, "argv", ["logqhint"] + argv), \
+                mock.patch.object(sys, "stdout", buf):
+            rc = logqhint.main()
+        return rc, buf.getvalue()
 
-    def test_cli_prints_grouped_summary(self):
-        out = io.StringIO()
-        with redirect_stdout(out), redirect_stderr(io.StringIO()):
-            code = logqhint.main(["logqhint", self.log_path, "--rules", self.rules_path])
-        self.assertEqual(code, 0)
-        text = out.getvalue()
-        self.assertIn("CRIT", text)
-        self.assertIn("WARN", text)
-        self.assertIn("2", text)  # CRIT 聚合 2 次
+    def test_rules_listing_text_and_json(self):
+        rc, out = self.run_main(["--rules"])
+        self.assertEqual(rc, 0)
+        self.assertIn("AUTH-FAIL", out)
+        rc, out = self.run_main(["--rules", "--format", "json"])
+        data = json.loads(out)
+        self.assertTrue(any(r["id"] == "SQLI" for r in data))
 
-    def test_cli_clean_log_prints_nothing_and_exits_zero(self):
-        clean = write_temp("all normal\n")
-        try:
-            out = io.StringIO()
-            with redirect_stdout(out), redirect_stderr(io.StringIO()):
-                code = logqhint.main(["logqhint", clean, "--rules", self.rules_path])
-            self.assertEqual(code, 0)
-            self.assertEqual(out.getvalue().strip(), "")
-        finally:
-            os.unlink(clean)
+    def test_json_output_contract(self):
+        rc, out = self.run_main([self.log, "--format", "json", "--top", "5"])
+        self.assertEqual(rc, 0)
+        data = json.loads(out)
+        for key in ("scanned_at", "target", "files_scanned", "finding_groups", "findings"):
+            self.assertIn(key, data)
+        self.assertEqual(data["files_scanned"], 1)
+        self.assertGreaterEqual(data["finding_groups"], 2)
+        rules = {f["rule"] for f in data["findings"]}
+        self.assertIn("SQLI", rules)
+        self.assertLessEqual(len(data["findings"]), 5)
 
-    def test_cli_bad_rules_file_reports_error(self):
-        err = io.StringIO()
-        with redirect_stdout(io.StringIO()), redirect_stderr(err):
-            code = logqhint.main(["logqhint", self.log_path, "--rules", "/nonexistent.rules"])
-        self.assertNotEqual(code, 0)
-        self.assertIn("rules", err.getvalue().lower())
+    def test_text_summary_has_rule_and_count(self):
+        rc, out = self.run_main([self.log])
+        self.assertEqual(rc, 0)
+        self.assertIn("AUTH-FAIL", out)
+
+    def test_brute_suspect_after_5_fails(self):
+        lines = "".join(
+            f"Jan 5 10:00:{i:02d} h sshd[1]: Failed password for root from 8.8.4.4 port 22\n"
+            for i in range(5))
+        p = _write(self.tmp, "brute.log", lines)
+        rc, out = self.run_main([p, "--format", "json"])
+        data = json.loads(out)
+        brute = [f for f in data["findings"] if f["rule"] == "BRUTE-SUSPECT"]
+        self.assertEqual(len(brute), 1)
+        self.assertEqual(brute[0]["severity"], "high")
+
+    def test_no_findings_message(self):
+        clean = _write(self.tmp, "clean.log", "all normal\n")
+        rc, out = self.run_main([clean])
+        self.assertEqual(rc, 0)
+        self.assertIn("未发现命中线索", out)
+
+    def test_missing_path_arg_errors(self):
+        with self.assertRaises(SystemExit):
+            self.run_main([])
+
+
+class CliEndToEndTest(unittest.TestCase):
+    """Real subprocess run — the README usage example must match this output."""
+
+    def test_subprocess_json(self):
+        tmp = tempfile.mkdtemp(prefix="lqh_")
+        log = os.path.join(tmp, "a.log")
+        with open(log, "w", encoding="utf-8") as f:
+            f.write("Jan 5 10:00:01 h sshd[1]: Failed password for root from 9.9.9.9\n")
+        mod = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logqhint.py")
+        proc = subprocess.run([sys.executable, mod, log, "--format", "json"],
+                              capture_output=True, encoding="utf-8", errors="replace",
+                              timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-400:])
+        data = json.loads(proc.stdout)
+        self.assertGreaterEqual(data["finding_groups"], 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
